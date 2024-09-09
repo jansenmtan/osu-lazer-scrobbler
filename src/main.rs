@@ -1,0 +1,97 @@
+use regex::{Captures, Regex};
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
+use std::path::Path;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
+
+mod lookout;
+mod scrobbler;
+
+fn get_lazer_log_path() -> PathBuf {
+    let mut pb = PathBuf::new();
+    // TODO: detect path rather than use hardcoded path
+    pb.push("D:\\osu-lazer\\logs");
+    pb
+}
+
+fn get_runtime_path() -> PathBuf {
+    let pattern = Regex::new(r"\d+\.runtime\.log").unwrap();
+    let lazer_log_dir = fs::read_dir(Path::new(&get_lazer_log_path())).unwrap();
+    let runtime_path = lazer_log_dir
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().map_or(false, |ft| ft.is_file()))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map_or(false, |name| pattern.is_match(name))
+        })
+        .max_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok())
+        .map(|entry| entry.path())
+        .unwrap();
+
+    runtime_path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_runtime_path() {
+        let result = get_runtime_path();
+        let pattern = Regex::new(r"\d+\.runtime\.log").unwrap();
+        dbg!(result.clone());
+        assert!(pattern.is_match(result.to_str().unwrap()))
+    }
+}
+
+async fn watch_and_send_lines(tx: Sender<String>) {
+    let mut lines = linemux::MuxedLines::new().unwrap();
+    dbg!(&get_runtime_path());
+    lines
+        .add_file(Path::new(&get_runtime_path()))
+        .await
+        .unwrap();
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        tx.send(line.line().into()).await.unwrap();
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    //println!("Monitoring for osu!lazer...");
+
+    let (tx, mut rx) = mpsc::channel::<String>(4);
+
+    // TODO: actually determine if osu!lazer is running
+    println!("osu!lazer is running. Performing actions...");
+    tokio::spawn(async move {
+        let watcher = watch_and_send_lines(tx);
+        watcher.await;
+    });
+
+    let mut scrobbler = scrobbler::Scrobbler::new().unwrap();
+    while let Some(line) = rx.recv().await {
+        println!("GOT = {}", line);
+        let pattern = Regex::new(r"^(?<date>\d{4}-\d{2}-\d{2}) (?<time_utc>\d{2}:\d{2}:\d{2}) \[.+\]: Song select working beatmap updated to (?<beatmap>(?<artist>.+) - (?<track>.+) \((?<creator>.+)\) \[(?<difficulty>.+)\])$").unwrap();
+        let _captures = pattern.captures(&line);
+        if _captures.is_none() {
+            continue; // yes, i am avoiding 1 (one) line indent
+        }
+        let captures = _captures.unwrap();
+        let artist = captures.name("artist").unwrap().as_str().to_owned();
+        let track = captures.name("track").unwrap().as_str().to_owned();
+        scrobbler.now_playing(artist, track, "".into()).unwrap();
+
+        // TODO: issues. i might have to use a Mutex or another channel (another mpsc?)
+        let task = tokio::spawn(async {
+            scrobbler.scrobble().await.unwrap();
+        });
+        task.await;
+
+    }
+}
